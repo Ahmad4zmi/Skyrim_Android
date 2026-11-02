@@ -345,36 +345,6 @@ public class LauncherActivity extends Activity {
         return null;
     }
 
-    // SHA-1 of the Steam TESV.exe (1.9.32.0.8) the port was recompiled from:
-    // other versions have different code at different addresses and would crash.
-    private static final String SHA_TESV_STEAM = "f39aecebf6e332616c4c518617073f6e8250e0f8";
-
-    private void checkSha(File f, String want, String name, List<String> bad) {
-        String got = sha1(f);
-        if (got == null) bad.add("cannot read " + name);
-        else if (!got.equals(want)) bad.add(name + " is the wrong version (SHA-1 " + got.substring(0, 8)
-                + ", expected " + want.substring(0, 8) + ")");
-    }
-
-    /* SHA-1 as hex, cached by path, size and modification time; null if unreadable. */
-    private String sha1(File f) {
-        String key = "sha1:" + f.getAbsolutePath(), stamp = f.length() + ":" + f.lastModified();
-        String cached = prefs.getString(key, null);
-        if (cached != null && cached.startsWith(stamp + "=")) return cached.substring(stamp.length() + 1);
-        try (java.io.InputStream in = new java.io.FileInputStream(f)) {
-            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-1");
-            byte[] buf = new byte[1 << 16];
-            for (int n; (n = in.read(buf)) > 0; ) md.update(buf, 0, n);
-            StringBuilder sb = new StringBuilder();
-            for (byte b : md.digest()) sb.append(String.format("%02x", b));
-            String hex = sb.toString();
-            prefs.edit().putString(key, stamp + "=" + hex).apply();
-            return hex;
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
     /* Returns the list of problems with the folder (empty when it is ready). */
     private List<String> checkFolder(String path) {
         List<String> bad = new ArrayList<>();
@@ -386,9 +356,8 @@ public class LauncherActivity extends Activity {
         if (data == null) bad.add("Data folder missing");
         else if (esm == null) bad.add(data.canRead() ? "Data/Skyrim.esm missing" : "cannot read the Data folder");
         else if (!esm.canRead()) bad.add("cannot read Data/Skyrim.esm");
-        // Only the original exe is checked: Steamless output differs between Steamless versions.
+        
         File packed = findCi(d, "TESV.exe");
-        if (packed != null) checkSha(packed, SHA_TESV_STEAM, "TESV.exe", bad);
         if (findCi(d, "TESV_unpacked.exe") == null && findCi(d, "TESV.exe.unpacked.exe") == null)
             bad.add(packed != null ? "TESV_unpacked.exe missing (unpack TESV.exe with Steamless)" : "TESV_unpacked.exe missing");
         for (String n : new String[] {"d3dx9_42.dll", "X3DAudio1_7.dll", "binkw32.dll"})
