@@ -1,0 +1,58 @@
+name: Build Skyrim Android APK
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:   # allows manual trigger from the Actions tab
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. Check out the code
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Set up JDK 17 (required by Gradle)
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      # 3. Set up the Android SDK with the required packages
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: |
+            platforms;android-34
+            build-tools;34.0.0
+            cmake;3.22.1
+            ndk;29.0.14206865
+
+      # 4. Cache Gradle dependencies to speed up subsequent builds
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('android/**/*.gradle*', 'android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      # 5. Build the debug APK (gen/ must already exist in the repo)
+      - name: Build Debug APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug -PndkVersion=29.0.14206865 --stacktrace
+
+      # 6. Upload the resulting APK as a downloadable artifact
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Skyrim-Android-debug
+          path: android/app/build/outputs/apk/debug/app-debug.apk
