@@ -1,58 +1,182 @@
-name: Build Skyrim Android APK
+name: Build APK
+
+# Place this file at: .github/workflows/build-apk.yml
+#
+# Required repository secret:
+#   GAME_FILES_URL  Direct-download URL (private / pre-signed) of a .zip that
+#                   contains, at its top level:
+#                     TESV_unpacked.exe, TESV.exe, d3dx9_42.dll,
+#                     binkw32.dll, X3DAudio1_7.dll
+#                   (the "Data" folder is NOT needed to build)
+#
+# IMPORTANT: the generated code and the APK are derived from the game's
+# executable. Run the build job only in a PRIVATE repository: artifacts of
+# public repositories can be downloaded by any signed-in GitHub user.
 
 on:
+  workflow_dispatch:
+    inputs:
+      force_regen:
+        description: "Ignore the cache and regenerate gen/ (slow: hours)"
+        type: boolean
+        default: false
   push:
-    branches: [ main ]
+    paths:
+      - "tools/**.py"
+      - "tools/**.sh"
   pull_request:
-    branches: [ main ]
-  workflow_dispatch:   # allows manual trigger from the Actions tab
+    paths:
+      - "tools/**.py"
+      - "tools/**.sh"
+
+env:
+  NDK_VERSION: 29.0.14206865
+  EXPECTED_SHA1_PREFIX: fed96638   # TESV_unpacked.exe (1.9.32.0.8, Steamless-unpacked)
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build:
+  # Cheap check, needs no game files. Safe to run in a public repo.
+  check-tools:
     runs-on: ubuntu-latest
     steps:
-      # 1. Check out the code
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      # 2. Set up JDK 17 (required by Gradle)
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          distribution: 'temurin'
-          java-version: '17'
+          python-version: "3.12"
+      - name: Byte-compile tools
+        run: python -m compileall -q tools
+      - name: Shell syntax check
+        run: |
+          for f in tools/*.sh desktop/*.sh; do
+            [ -f "$f" ] && bash -n "$f" && echo "ok: $f"
+          done
+          true
 
-      # 3. Set up the Android SDK with the required packages
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+  build-apk:
+    if: github.event_name == 'workflow_dispatch'
+    needs: check-tools
+    runs-on: ubuntu-latest
+    timeout-minutes: 355   # hosted-runner hard limit is 360
+
+    steps:
+      - uses: actions/checkout@v4
         with:
-          packages: |
-            platforms;android-34
-            build-tools;34.0.0
-            cmake;3.22.1
-            ndk;29.0.14206865
+          submodules: recursive
 
-      # 4. Cache Gradle dependencies to speed up subsequent builds
-      - name: Cache Gradle
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost || true
+          df -h /
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python deps
+        run: pip install capstone==5.0.9 pefile==2024.8.26
+
+      # ---------- Game files (never cached, never uploaded) ----------
+      - name: Download game files
+        env:
+          GAME_FILES_URL: ${{ secrets.GAME_FILES_URL }}
+        run: |
+          if [ -z "$GAME_FILES_URL" ]; then
+            echo "::error::Secret GAME_FILES_URL is not set"; exit 1
+          fi
+          mkdir -p GAME
+          curl -fsSL "$GAME_FILES_URL" -o game.zip
+          unzip -qo game.zip -d GAME
+          rm -f game.zip
+          # flatten if the zip had a single top-level folder
+          if [ ! -f GAME/TESV_unpacked.exe ]; then
+            sub=$(find GAME -maxdepth 2 -name TESV_unpacked.exe -printf '%h\n' | head -n1)
+            [ -n "$sub" ] && mv "$sub"/* GAME/ || true
+          fi
+          for f in TESV_unpacked.exe TESV.exe d3dx9_42.dll binkw32.dll X3DAudio1_7.dll; do
+            [ -f "GAME/$f" ] || { echo "::error::Missing GAME/$f"; exit 1; }
+          done
+
+      - name: Verify executable hash
+        run: |
+          sum=$(sha1sum GAME/TESV_unpacked.exe | cut -d' ' -f1)
+          echo "TESV_unpacked.exe sha1: $sum"
+          case "$sum" in
+            $EXPECTED_SHA1_PREFIX*) ;;
+            *) echo "::error::Unexpected TESV_unpacked.exe (need 1.9.32.0.8, unpacked)"; exit 1 ;;
+          esac
+
+      # ---------- Stage 1: recompiled code (slow, cached) ----------
+      - name: Restore generated code cache
+        id: gen-cache
+        if: ${{ !inputs.force_regen }}
         uses: actions/cache@v4
         with:
           path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-${{ hashFiles('android/**/*.gradle*', 'android/gradle/wrapper/gradle-wrapper.properties') }}
+            gen
+            analysis
+          key: gen-${{ env.EXPECTED_SHA1_PREFIX }}-${{ hashFiles('tools/lift.py', 'tools/discover.py', 'tools/regen_gen.sh') }}
           restore-keys: |
-            ${{ runner.os }}-gradle-
+            gen-${{ env.EXPECTED_SHA1_PREFIX }}-
 
-      # 5. Build the debug APK (gen/ must already exist in the repo)
-      - name: Build Debug APK
+      - name: Generate recompiled code
+        if: ${{ inputs.force_regen || steps.gen-cache.outputs.cache-hit != 'true' }}
+        run: |
+          chmod +x tools/regen_gen.sh
+          tools/regen_gen.sh GAME
+
+      # Save explicitly so a successful (but later-failing) run still keeps gen/
+      - name: Save generated code cache
+        if: ${{ inputs.force_regen || steps.gen-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            gen
+            analysis
+          key: gen-${{ env.EXPECTED_SHA1_PREFIX }}-${{ hashFiles('tools/lift.py', 'tools/discover.py', 'tools/regen_gen.sh') }}
+
+      # ---------- Stage 2: APK ----------
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK components
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-34" "build-tools;34.0.0" \
+            "cmake;3.22.1" "ndk;${NDK_VERSION}"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Launcher icon (optional)
+        run: python3 tools/make_icon.py GAME/TESV_unpacked.exe
+        continue-on-error: true
+
+      - name: Build debug APK
         working-directory: android
         run: |
           chmod +x gradlew
-          ./gradlew assembleDebug -PndkVersion=29.0.14206865 --stacktrace
+          ./gradlew assembleDebug -PndkVersion=${NDK_VERSION} --no-daemon
 
-      # 6. Upload the resulting APK as a downloadable artifact
+      - name: Rename APK
+        run: |
+          mkdir -p dist
+          cp android/app/build/outputs/apk/debug/app-debug.apk \
+             "dist/Skyrim-${GITHUB_SHA::7}.apk"
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: Skyrim-Android-debug
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          name: Skyrim-apk
+          path: dist/*.apk
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: Remove game files
+        if: always()
+        run: rm -rf GAME
